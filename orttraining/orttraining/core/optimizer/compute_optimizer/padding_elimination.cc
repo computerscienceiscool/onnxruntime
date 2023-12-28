@@ -216,6 +216,7 @@ void IterateSubgraphFromNode(Graph& graph,
                              std::unordered_set<Node*>& candidate_outputs,
                              bool apply_padding_removal,
                              InlinedHashMap<const Node*, size_t>& inspect_activation_node_ptr_to_its_output_rank,
+                             std::unordered_set<Node*>& skip_nodes,
                              const logging::Logger& logger) {
   std::queue<Node*> to_visit;
   std::unordered_set<Node*> visited;
@@ -245,6 +246,7 @@ void IterateSubgraphFromNode(Graph& graph,
         subgraph.insert(cur->MutableOutputDefs()[0]);
         PushAllOutputNode(graph, to_visit, cur, visited);
         candidate_inputs.insert(cur);
+        skip_nodes.insert(cur);
       } else {
         LOG_DEBUG_INFO(logger, "PaddingElimination::Input of node:" + cur->Name() + " have no shape.");
         candidate_outputs.insert(cur);
@@ -273,6 +275,7 @@ void IterateSubgraphFromNode(Graph& graph,
       } else {
         subgraph.insert(cur->MutableOutputDefs()[0]);
         PushAllOutputNode(graph, to_visit, cur, visited);
+        skip_nodes.insert(cur);
       }
     } else if (graph_utils::IsSupportedOptypeVersionAndDomain(*cur, "Dropout", {12, 13})) {
       ORT_ENFORCE(subgraph.find(cur->MutableInputDefs()[0]) != subgraph.end());
@@ -284,6 +287,7 @@ void IterateSubgraphFromNode(Graph& graph,
       ORT_ENFORCE(subgraph.find(cur->MutableInputDefs()[0]) != subgraph.end());
       subgraph.insert(cur->MutableOutputDefs()[0]);
       PushAllOutputNode(graph, to_visit, cur, visited);
+      skip_nodes.insert(cur);
     } else if (graph_utils::IsSupportedOptypeVersionAndDomain(*cur, "MatMul", {1, 9, 13}) ||
                graph_utils::IsSupportedOptypeVersionAndDomain(*cur, "MatMulBnb4", {1}, kMSDomain)) {
       if (subgraph.find(cur->MutableInputDefs()[0]) != subgraph.end()) {
@@ -294,6 +298,7 @@ void IterateSubgraphFromNode(Graph& graph,
         if (cur->InputDefs()[0]->Shape()->dim_size() > 2) {
           subgraph.insert(cur->MutableOutputDefs()[0]);
           PushAllOutputNode(graph, to_visit, cur, visited);
+          skip_nodes.insert(cur);
         } else {
           LOG_DEBUG_INFO(logger,
                          "PaddingElimination::dim size of left input of MatMul smaller than 3 and \
@@ -463,9 +468,10 @@ Status PaddingElimination::ApplyImpl(Graph& graph, bool& modified, int graph_lev
   }
 
   InlinedHashMap<const Node*, size_t> inspect_activation_node_ptr_to_its_output_rank;
+  std::unordered_set<Node*> skip_nodes;
 
   IterateSubgraphFromNode(graph, embedding_node, subgraph, candidate_inputs, candidate_outputs, enable_,
-                          inspect_activation_node_ptr_to_its_output_rank, logger);
+                          inspect_activation_node_ptr_to_its_output_rank, skip_nodes, logger);
 
   if (!enable_ && inspect_activation_node_ptr_to_its_output_rank.size() == 0) {
     LOG_DEBUG_INFO(logger,
@@ -621,6 +627,7 @@ Status PaddingElimination::ApplyImpl(Graph& graph, bool& modified, int graph_lev
     return Status::OK();
   }
 
+
   // Get the first two dims value of input_ids which is [batch_size, seq_len]
   NodeArg* first_two_dims_arg = GetDimsValue(graph,
                                              input_ids_arg,
@@ -691,6 +698,26 @@ Status PaddingElimination::ApplyImpl(Graph& graph, bool& modified, int graph_lev
       ORT_ENFORCE(input_shape->dim(k).has_dim_value());
       flattened_shape.add_dim()->set_dim_value(input_shape->dim(k).dim_value());
       edge->SetShape(flattened_shape);
+    }
+  }
+
+  for (auto matmul_op : skip_nodes) {
+    // std::cout<<"skip node:"<<matmul_op->Name()<<std::endl;
+    // recover pad before matmul and pad after matmul
+    InsertNodesForOutput(graph, *matmul_op, 0, squeeze_out_arg, first_two_dims_arg, logger);
+    InlinedHashMap<Node*, size_t> matmul_output_to_its_rank;
+    for(auto iter = matmul_op->OutputNodesBegin(); iter != matmul_op->OutputNodesEnd(); ++iter) {
+      Node* matmul_output_node = graph.GetNode(iter->Index());
+      for (size_t i = 0; i < matmul_output_node->InputDefs().size(); ++i) {
+        if (matmul_output_node->MutableInputDefs()[i] == matmul_op->MutableOutputDefs()[0]) {
+          matmul_output_to_its_rank.insert({matmul_output_node, i});
+        }
+      }
+    }
+    for(auto iter = matmul_output_to_its_rank.begin(); iter != matmul_output_to_its_rank.end(); ++iter) {
+      Node* matmul_output_node = iter->first;
+      size_t matmul_output_rank = iter->second;
+      InsertFlattenPatternForInput(graph, *matmul_output_node, matmul_output_rank, squeeze_out_arg, logger);
     }
   }
   if (handled_input_count > 0 || handled_output_count > 0) {
